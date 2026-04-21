@@ -1,0 +1,44 @@
+version: "3.8"
+
+services:
+  db:
+    image: docker.io/library/postgres:15-alpine
+    container_name: falcon_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: falcon
+      POSTGRES_PASSWORD: falconpass
+      POSTGRES_DB: falcon_university
+    network_mode: host
+    volumes:
+      - falcon_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U falcon -d falcon_university"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    image: localhost/falcon-backend:latest
+    container_name: falcon_backend
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://falcon:falconpass@localhost:5432/falcon_university
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      SECRET_KEY: ${SECRET_KEY:-supersecretkey}
+    network_mode: host
+    depends_on:
+      - db
+    healthcheck:
+      test: ["CMD", "python", "app/healthcheck.py"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+volumes:
+  falcon_postgres_data:
