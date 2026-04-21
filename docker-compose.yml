@@ -33,6 +33,9 @@ services:
     network_mode: host
     depends_on:
       - db
+    volumes:
+      - falcon_uploads:/app/uploads
+      - falcon_chroma_data:/app/chroma_db
     healthcheck:
       test: ["CMD", "python", "app/healthcheck.py"]
       interval: 15s
@@ -42,3 +45,5 @@ services:
 
 volumes:
   falcon_postgres_data:
+  falcon_uploads:
+  falcon_chroma_data:

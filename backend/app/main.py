@@ -1,10 +1,14 @@
-from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi import FastAPI, Depends, HTTPException, status, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 import os
+import shutil
 
 from app.database import engine, Base, get_db
-from app import models, schemas, auth
+from app import models, schemas, auth, knowledge_base
+
+UPLOAD_DIR = os.getenv("UPLOAD_DIR", "/app/uploads")
+os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 app = FastAPI(
     title="Falcon University Admission Bot API",
@@ -71,3 +75,93 @@ def login(payload: schemas.UserCreate, db: Session = Depends(get_db)):
 def me(current_user: models.User = Depends(auth.get_current_user)):
     """Get current authenticated user."""
     return current_user
+
+
+# -----------------------
+# Document / Knowledge Base endpoints
+# -----------------------
+
+@app.post("/documents/upload", response_model=schemas.DocumentOut, tags=["Documents"])
+def upload_document(
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user),
+):
+    """Upload a PDF and ingest it into the knowledge base."""
+    if not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only PDF files are accepted")
+
+    # Save file to disk
+    file_path = os.path.join(UPLOAD_DIR, file.filename)
+    with open(file_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+
+    # Extract text using pdfplumber
+    try:
+        import pdfplumber
+        text_parts = []
+        with pdfplumber.open(file_path) as pdf:
+            for page in pdf.pages:
+                page_text = page.extract_text()
+                if page_text:
+                    text_parts.append(page_text)
+        extracted_text = "\n".join(text_parts)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to extract PDF text: {e}")
+
+    # Persist to DB
+    doc = models.Document(filename=file.filename, content=extracted_text)
+    db.add(doc)
+    db.commit()
+    db.refresh(doc)
+
+    # Ingest into Chroma
+    knowledge_base.ingest_document(doc.id, extracted_text)
+
+    return doc
+
+
+@app.get("/documents", response_model=list[schemas.DocumentList], tags=["Documents"])
+def list_documents(
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user),
+):
+    """List all uploaded documents."""
+    return db.query(models.Document).all()
+
+
+@app.get("/documents/{doc_id}", response_model=schemas.DocumentOut, tags=["Documents"])
+def get_document(
+    doc_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user),
+):
+    """Get a single document by ID."""
+    doc = db.query(models.Document).filter(models.Document.id == doc_id).first()
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+    return doc
+
+
+@app.delete("/documents/{doc_id}", tags=["Documents"])
+def delete_document(
+    doc_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_user),
+):
+    """Delete a document and remove it from the knowledge base."""
+    doc = db.query(models.Document).filter(models.Document.id == doc_id).first()
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    # Remove from Chroma
+    knowledge_base.delete_document(doc_id)
+
+    # Remove file from disk
+    file_path = os.path.join(UPLOAD_DIR, doc.filename)
+    if os.path.exists(file_path):
+        os.remove(file_path)
+
+    db.delete(doc)
+    db.commit()
+    return {"detail": "Document deleted"}
