@@ -4,6 +4,8 @@ from sqlalchemy.orm import Session
 import os
 import shutil
 
+from openai import OpenAI
+
 from app.database import engine, Base, get_db
 from app import models, schemas, auth, knowledge_base
 
@@ -165,3 +167,61 @@ def delete_document(
     db.delete(doc)
     db.commit()
     return {"detail": "Document deleted"}
+
+
+# -----------------------
+# Chat endpoint
+# -----------------------
+
+_llm_client = None
+
+
+def get_llm_client():
+    global _llm_client
+    if _llm_client is None:
+        _llm_client = OpenAI(
+            api_key=os.getenv("OPENAI_API_KEY", ""),
+            base_url="http://localhost:11434/v1",
+        )
+    return _llm_client
+
+
+@app.post("/chat", response_model=schemas.ChatResponse, tags=["Chat"])
+def chat(payload: schemas.ChatRequest):
+    """Handle a student chat message. Queries the knowledge base and returns an LLM response."""
+    # 1. Retrieve relevant context from knowledge base
+    try:
+        docs = knowledge_base.query_kb(payload.message, k=4)
+        context = "\n\n".join([d.page_content for d in docs]) if docs else ""
+    except Exception:
+        context = ""
+
+    # 2. Build system prompt
+    system_prompt = (
+        "You are the Falcon University admission assistant. "
+        "Help prospective students with questions about admission requirements, programs, deadlines, and eligibility. "
+        "Be concise, friendly, and factual."
+    )
+    if context:
+        system_prompt += (
+            "\n\nUse the following retrieved university documents to answer the student's question:\n"
+            + context
+        )
+
+    # 3. Call LLM gateway
+    try:
+        client = get_llm_client()
+        response = client.chat.completions.create(
+            model="gpt-5.4-nano",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": payload.message},
+            ],
+            temperature=0.7,
+            max_tokens=512,
+        )
+        answer = response.choices[0].message.content or "..."
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"LLM inference failed: {e}")
+
+    return {"response": answer}
