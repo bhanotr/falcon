@@ -107,7 +107,7 @@ class FalconStack(Stack):
         instance = ec2.Instance(
             self,
             "FalconInstance",
-            instance_type=ec2.InstanceType("t3.medium"),
+            instance_type=ec2.InstanceType("c7i-flex.large"),
             machine_image=ami,
             vpc=vpc,
             vpc_subnets=ec2.SubnetSelection(subnet_type=ec2.SubnetType.PUBLIC),
