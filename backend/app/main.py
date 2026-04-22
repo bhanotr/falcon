@@ -296,34 +296,52 @@ def _evaluate_applicant(applicant_id: int, db: Session) -> dict:
         .order_by(models.ChatMessage.created_at)
         .all()
     )
+
+    # Build transcripts
     transcript = "\n".join([f"{m.role}: {m.content}" for m in messages])
+    user_responses = []
+    for m in messages:
+        if m.role == "user":
+            user_responses.append(f"- {m.content}")
+    user_transcript = "\n".join(user_responses) if user_responses else "(no responses yet)"
 
     # Query KB for program requirements
-    docs = knowledge_base.query_kb(f"{applicant.program} admission requirements eligibility", k=4)
+    docs = knowledge_base.query_kb(f"{applicant.program} admission requirements eligibility", k=6)
     context = "\n\n".join([d.page_content for d in docs]) if docs else ""
 
     eval_prompt = (
-        "You are the Falcon University admission evaluation officer.\n"
-        "Review the following interview transcript and program requirements.\n"
-        "Extract all applicant details and determine eligibility.\n\n"
+        "You are the Falcon University admission evaluation officer. "
+        "Your job is to review the applicant's stated information against the OFFICIAL program requirements provided below, "
+        "and return a definitive JSON verdict.\n\n"
+        "CRITICAL INSTRUCTIONS:\n"
+        "1. The official program requirements ARE provided below under 'Program Requirements'. Use ONLY those requirements.\n"
+        "2. The applicant's stated information is provided under 'Applicant Responses'. Read it carefully.\n"
+        "3. Do NOT say you lack information or cannot confirm. Work with what the applicant provided.\n"
+        "4. Compare each requirement against the applicant's responses and decide definitively.\n"
+        "5. If the applicant meets all stated requirements → status = 'eligible'.\n"
+        "6. If the applicant fails one or more hard requirements → status = 'not_eligible'.\n"
+        "7. If the applicant is missing required documents or information → status = 'needs_more_info'.\n"
+        "8. Your reasoning must be brief (1-2 sentences max).\n"
+        "9. If status is 'needs_more_info', list the exact missing items in 'missing_items' array.\n\n"
         "Respond ONLY with valid JSON in this exact format:\n"
         '{\n'
         '  "name": "...",\n'
         '  "program": "...",\n'
         '  "details": { "age": null, "gpa": null, "sat_score": null, "act_score": null, "english_test": null, "has_recommendation": null, "has_personal_statement": null, "high_school_completed": null, "math_courses": null },\n'
-        '  "eligible": true,\n'
-        '  "reasoning": "...",\n'
-        '  "next_steps": "..."\n'
+        '  "status": "eligible | not_eligible | needs_more_info",\n'
+        '  "reasoning": "1-2 sentence explanation",\n'
+        '  "missing_items": ["item 1", "item 2"],\n'
+        '  "next_steps": "what the applicant should do next"\n'
         "}\n\n"
         f"Program Requirements:\n{context}\n\n"
-        f"Interview Transcript:\n{transcript}"
+        f"Applicant Responses:\n{user_transcript}"
     )
 
     client = get_llm_client()
     response = client.chat.completions.create(
         model="gpt-5.4-nano",
         messages=[{"role": "system", "content": eval_prompt}],
-        temperature=0.2,
+        temperature=0.1,
         max_tokens=1024,
     )
 
@@ -331,7 +349,47 @@ def _evaluate_applicant(applicant_id: int, db: Session) -> dict:
     try:
         result = _extract_json(content)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to parse evaluation JSON: {e}")
+        # Fallback: create a basic result so we don't crash
+        result = {
+            "name": applicant.name,
+            "program": applicant.program,
+            "details": applicant.details or {},
+            "status": "needs_more_info",
+            "reasoning": f"Evaluation parsing failed: {e}. Please contact admissions.",
+            "missing_items": [],
+            "next_steps": "Contact Falcon University admissions office for manual review.",
+        }
+
+    # Normalize status field
+    status = result.get("status", "needs_more_info").lower().strip()
+    if status not in ("eligible", "not_eligible", "needs_more_info"):
+        # Try to infer from old 'eligible' boolean field for backward compatibility
+        if "eligible" in result:
+            status = "eligible" if result["eligible"] else "not_eligible"
+        else:
+            status = "needs_more_info"
+    result["status"] = status
+
+    # Build clean user-facing message
+    reasoning = result.get("reasoning", "").strip()
+    next_steps = result.get("next_steps", "").strip()
+    missing_items = result.get("missing_items", []) or []
+
+    if status == "eligible":
+        user_message = f"Congratulations! You are eligible for the {result.get('program', applicant.program)} program.\n\n{reasoning}"
+    elif status == "not_eligible":
+        user_message = f"Thank you for your interest. Unfortunately, you do not meet the eligibility criteria for the {result.get('program', applicant.program)} program at this time.\n\n{reasoning}"
+    else:  # needs_more_info
+        user_message = f"Thank you for providing your information. To complete your evaluation for the {result.get('program', applicant.program)} program, we need the following:\n"
+        if missing_items:
+            user_message += "\n" + "\n".join([f"- {item}" for item in missing_items])
+        else:
+            user_message += "\n- Additional required documents or information"
+        if reasoning:
+            user_message += f"\n\n{reasoning}"
+
+    if next_steps:
+        user_message += f"\n\nNext steps: {next_steps}"
 
     # Update applicant record
     applicant.name = result.get("name", applicant.name)
@@ -343,14 +401,14 @@ def _evaluate_applicant(applicant_id: int, db: Session) -> dict:
     # Create assessment record
     assessment = models.Assessment(
         applicant_id=applicant.id,
-        outcome="eligible" if result.get("eligible") else "not eligible",
-        rule_summary=result.get("reasoning", ""),
+        outcome=status,
+        rule_summary=reasoning,
         transcript=transcript,
     )
     db.add(assessment)
     db.commit()
 
-    return result
+    return {**result, "user_message": user_message}
 
 
 @app.post("/interview/start", response_model=schemas.InterviewStartResponse, tags=["Interview"])
@@ -454,9 +512,15 @@ def interview_chat(applicant_id: int, payload: schemas.InterviewChatRequest, db:
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"LLM inference failed: {e}")
 
+    # Detect user intent to force evaluation (e.g., "evaluate", "done", "finish")
+    force_eval = any(
+        kw in payload.message.lower()
+        for kw in ["evaluate", "evaluation", "done", "finish", "that's all", "that is all", "enough", "wrap up", "conclude"]
+    )
+
     # Check for interview completion
-    interview_complete = "[INTERVIEW_COMPLETE]" in answer
-    if interview_complete:
+    interview_complete = "[INTERVIEW_COMPLETE]" in answer or force_eval
+    if "[INTERVIEW_COMPLETE]" in answer:
         answer = answer.replace("[INTERVIEW_COMPLETE]", "").strip()
 
     # Persist bot response
@@ -471,11 +535,7 @@ def interview_chat(applicant_id: int, payload: schemas.InterviewChatRequest, db:
     if interview_complete:
         try:
             result = _evaluate_applicant(applicant.id, db)
-            verdict = result.get("reasoning", "Evaluation complete.")
-            next_steps = result.get("next_steps", "")
-            if next_steps:
-                verdict += f"\n\nNext steps: {next_steps}"
-            answer = verdict
+            answer = result.get("user_message", "Evaluation complete.")
         except Exception as e:
             answer = f"Interview complete, but evaluation failed: {e}"
 
