@@ -26,7 +26,7 @@ export default function ChatModal({
   useEffect(() => {
     if (isOpen && applicantId) {
       setIsComplete(false);
-      fetch(`http://localhost:8000/interview/${applicantId}/messages`)
+      fetch(`/api/interview/${applicantId}/messages`)
         .then((res) => {
           if (!res.ok) throw new Error("Failed to load messages");
           return res.json();
@@ -70,7 +70,7 @@ export default function ChatModal({
 
     try {
       const res = await fetch(
-        `http://localhost:8000/interview/${applicantId}/chat`,
+        `/api/interview/${applicantId}/chat`,
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },

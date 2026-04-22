@@ -34,7 +34,7 @@ export default function Home() {
     const results: InterviewItem[] = [];
     for (const id of ids) {
       try {
-        const res = await fetch(`http://localhost:8000/interview/${id}/status`);
+        const res = await fetch(`/api/interview/${id}/status`);
         if (res.ok) {
           const data = await res.json();
           results.push(data);
@@ -65,7 +65,7 @@ export default function Home() {
 
   const startNewInterview = async () => {
     try {
-      const res = await fetch("http://localhost:8000/interview/start", {
+      const res = await fetch("/api/interview/start", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
       });
