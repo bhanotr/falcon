@@ -1,8 +1,11 @@
 from fastapi import FastAPI, Depends, HTTPException, status, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
+from sqlalchemy import inspect, text
 import os
 import shutil
+import json
+import re
 
 from openai import OpenAI
 
@@ -30,6 +33,14 @@ app.add_middleware(
 @app.on_event("startup")
 def on_startup():
     Base.metadata.create_all(bind=engine)
+    # Inline migration: add new columns to existing tables if missing
+    inspector = inspect(engine)
+    applicant_cols = [c["name"] for c in inspector.get_columns("applicants")]
+    with engine.begin() as conn:
+        if "details" not in applicant_cols:
+            conn.execute(text("ALTER TABLE applicants ADD COLUMN details JSONB DEFAULT '{}'"))
+        if "is_complete" not in applicant_cols:
+            conn.execute(text("ALTER TABLE applicants ADD COLUMN is_complete BOOLEAN DEFAULT FALSE"))
 
 
 @app.get("/health", tags=["Health"])
@@ -225,3 +236,247 @@ def chat(payload: schemas.ChatRequest):
         raise HTTPException(status_code=500, detail=f"LLM inference failed: {e}")
 
     return {"response": answer}
+
+
+# -----------------------
+# Interview endpoints
+# -----------------------
+
+INTERVIEW_GREETING = (
+    "Hello! Welcome to Falcon University Admission Pre-Assessment. "
+    "My name is FalconBot, and I'll be guiding you through a quick interview to evaluate your eligibility. "
+    "Let's get started — what is your full name?"
+)
+
+
+def _build_interview_system_prompt(applicant: models.Applicant, context: str) -> str:
+    details = json.dumps(applicant.details or {}, indent=2)
+    return (
+        "You are the Falcon University admission assistant conducting a structured pre-assessment interview.\n\n"
+        f"Current applicant info:\n"
+        f"- Name: {applicant.name}\n"
+        f"- Program: {applicant.program}\n"
+        f"- Known details: {details}\n\n"
+        "Interview rules:\n"
+        "1. Ask ONE question at a time. Be friendly and concise.\n"
+        '2. If the name is "Anonymous", ask for the student\'s full name first.\n'
+        '3. If the program is "Unknown", ask which program they are interested in (Business or Computer Science).\n'
+        "4. Once the program is known, use the retrieved program requirements below to ask for each missing requirement ONE BY ONE.\n"
+        "5. Do NOT list all requirements at once. Ask about them individually.\n"
+        '6. If the student says they do not have something or do not know, note it and move on.\n'
+        "7. Only give your final verdict when you have enough information to determine eligibility.\n"
+        "8. End your final message with exactly [INTERVIEW_COMPLETE].\n\n"
+        "Program requirements from university documents:\n"
+        f"{context}"
+    )
+
+
+def _extract_json(text: str) -> dict:
+    """Extract JSON object from text, handling markdown code blocks."""
+    # Try ```json ... ``` or ``` ... ```
+    match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+    if match:
+        return json.loads(match.group(1))
+    # Try raw JSON object
+    match = re.search(r"(\{.*\})", text, re.DOTALL)
+    if match:
+        return json.loads(match.group(1))
+    raise ValueError("No JSON found in LLM response")
+
+
+def _evaluate_applicant(applicant_id: int, db: Session) -> dict:
+    """Run evaluation via LLM and update DB. Returns evaluation dict."""
+    applicant = db.query(models.Applicant).filter(models.Applicant.id == applicant_id).first()
+    if not applicant:
+        raise HTTPException(status_code=404, detail="Applicant not found")
+
+    messages = (
+        db.query(models.ChatMessage)
+        .filter(models.ChatMessage.applicant_id == applicant_id)
+        .order_by(models.ChatMessage.created_at)
+        .all()
+    )
+    transcript = "\n".join([f"{m.role}: {m.content}" for m in messages])
+
+    # Query KB for program requirements
+    docs = knowledge_base.query_kb(f"{applicant.program} admission requirements eligibility", k=4)
+    context = "\n\n".join([d.page_content for d in docs]) if docs else ""
+
+    eval_prompt = (
+        "You are the Falcon University admission evaluation officer.\n"
+        "Review the following interview transcript and program requirements.\n"
+        "Extract all applicant details and determine eligibility.\n\n"
+        "Respond ONLY with valid JSON in this exact format:\n"
+        '{\n'
+        '  "name": "...",\n'
+        '  "program": "...",\n'
+        '  "details": { "age": null, "gpa": null, "sat_score": null, "act_score": null, "english_test": null, "has_recommendation": null, "has_personal_statement": null, "high_school_completed": null, "math_courses": null },\n'
+        '  "eligible": true,\n'
+        '  "reasoning": "...",\n'
+        '  "next_steps": "..."\n'
+        "}\n\n"
+        f"Program Requirements:\n{context}\n\n"
+        f"Interview Transcript:\n{transcript}"
+    )
+
+    client = get_llm_client()
+    response = client.chat.completions.create(
+        model="gpt-5.4-nano",
+        messages=[{"role": "system", "content": eval_prompt}],
+        temperature=0.2,
+        max_tokens=1024,
+    )
+
+    content = response.choices[0].message.content or "{}"
+    try:
+        result = _extract_json(content)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to parse evaluation JSON: {e}")
+
+    # Update applicant record
+    applicant.name = result.get("name", applicant.name)
+    applicant.program = result.get("program", applicant.program)
+    applicant.details = result.get("details", {})
+    applicant.is_complete = True
+    db.commit()
+
+    # Create assessment record
+    assessment = models.Assessment(
+        applicant_id=applicant.id,
+        outcome="eligible" if result.get("eligible") else "not eligible",
+        rule_summary=result.get("reasoning", ""),
+        transcript=transcript,
+    )
+    db.add(assessment)
+    db.commit()
+
+    return result
+
+
+@app.post("/interview/start", response_model=schemas.InterviewStartResponse, tags=["Interview"])
+def interview_start(db: Session = Depends(get_db)):
+    """Start a new admission interview. Creates an applicant and returns the opening greeting."""
+    applicant = models.Applicant(name="Anonymous", program="Unknown")
+    db.add(applicant)
+    db.commit()
+    db.refresh(applicant)
+
+    # Persist greeting as first bot message
+    greeting_msg = models.ChatMessage(
+        applicant_id=applicant.id,
+        role="bot",
+        content=INTERVIEW_GREETING,
+    )
+    db.add(greeting_msg)
+    db.commit()
+
+    return {"applicant_id": applicant.id, "greeting": INTERVIEW_GREETING}
+
+
+@app.get("/interview/{applicant_id}/status", response_model=schemas.InterviewStatus, tags=["Interview"])
+def interview_status(applicant_id: int, db: Session = Depends(get_db)):
+    """Get the current status of an interview (name, program, completion)."""
+    applicant = db.query(models.Applicant).filter(models.Applicant.id == applicant_id).first()
+    if not applicant:
+        raise HTTPException(status_code=404, detail="Applicant not found")
+    return applicant
+
+
+@app.get("/interview/{applicant_id}/messages", response_model=list[schemas.ChatMessageOut], tags=["Interview"])
+def interview_messages(applicant_id: int, db: Session = Depends(get_db)):
+    """Get all chat messages for an interview, ordered by time."""
+    applicant = db.query(models.Applicant).filter(models.Applicant.id == applicant_id).first()
+    if not applicant:
+        raise HTTPException(status_code=404, detail="Applicant not found")
+    messages = (
+        db.query(models.ChatMessage)
+        .filter(models.ChatMessage.applicant_id == applicant_id)
+        .order_by(models.ChatMessage.created_at)
+        .all()
+    )
+    return messages
+
+
+@app.post("/interview/{applicant_id}/chat", response_model=schemas.InterviewChatResponse, tags=["Interview"])
+def interview_chat(applicant_id: int, payload: schemas.InterviewChatRequest, db: Session = Depends(get_db)):
+    """Handle one turn of the guided interview. Loads history, queries KB, calls LLM, checks for completion."""
+    applicant = db.query(models.Applicant).filter(models.Applicant.id == applicant_id).first()
+    if not applicant:
+        raise HTTPException(status_code=404, detail="Applicant not found")
+    if applicant.is_complete:
+        return {"response": "This interview has already been completed. Thank you!", "interview_complete": True}
+
+    # Persist user message
+    user_msg = models.ChatMessage(
+        applicant_id=applicant.id,
+        role="user",
+        content=payload.message,
+    )
+    db.add(user_msg)
+    db.commit()
+
+    # Load full transcript
+    messages = (
+        db.query(models.ChatMessage)
+        .filter(models.ChatMessage.applicant_id == applicant_id)
+        .order_by(models.ChatMessage.created_at)
+        .all()
+    )
+
+    # Build LLM message list
+    llm_messages = []
+
+    # Query KB if program is known
+    context = ""
+    if applicant.program and applicant.program != "Unknown":
+        try:
+            docs = knowledge_base.query_kb(f"{applicant.program} admission requirements eligibility", k=4)
+            context = "\n\n".join([d.page_content for d in docs]) if docs else ""
+        except Exception:
+            context = ""
+
+    system_prompt = _build_interview_system_prompt(applicant, context)
+    llm_messages.append({"role": "system", "content": system_prompt})
+
+    for m in messages:
+        llm_messages.append({"role": "user" if m.role == "user" else "assistant", "content": m.content})
+
+    # Call LLM
+    try:
+        client = get_llm_client()
+        response = client.chat.completions.create(
+            model="gpt-5.4-nano",
+            messages=llm_messages,
+            temperature=0.7,
+            max_tokens=512,
+        )
+        answer = response.choices[0].message.content or "..."
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"LLM inference failed: {e}")
+
+    # Check for interview completion
+    interview_complete = "[INTERVIEW_COMPLETE]" in answer
+    if interview_complete:
+        answer = answer.replace("[INTERVIEW_COMPLETE]", "").strip()
+
+    # Persist bot response
+    bot_msg = models.ChatMessage(
+        applicant_id=applicant.id,
+        role="bot",
+        content=answer,
+    )
+    db.add(bot_msg)
+    db.commit()
+
+    if interview_complete:
+        try:
+            result = _evaluate_applicant(applicant.id, db)
+            verdict = result.get("reasoning", "Evaluation complete.")
+            next_steps = result.get("next_steps", "")
+            if next_steps:
+                verdict += f"\n\nNext steps: {next_steps}"
+            answer = verdict
+        except Exception as e:
+            answer = f"Interview complete, but evaluation failed: {e}"
+
+    return {"response": answer, "interview_complete": interview_complete}

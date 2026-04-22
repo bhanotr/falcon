@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey, func
+from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey, func, JSON, Boolean
 from sqlalchemy.orm import relationship
 from app.database import Base
 
@@ -17,7 +17,9 @@ class Applicant(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String, nullable=False, default="Anonymous")
-    program = Column(String, nullable=False)
+    program = Column(String, nullable=False, default="Unknown")
+    details = Column(JSON, nullable=True, default=dict)
+    is_complete = Column(Boolean, default=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     assessments = relationship("Assessment", back_populates="applicant", cascade="all, delete-orphan")

@@ -46,3 +46,41 @@ class ChatRequest(BaseModel):
 
 class ChatResponse(BaseModel):
     response: str
+
+
+# -----------------------
+# Interview schemas
+# -----------------------
+
+class InterviewStartResponse(BaseModel):
+    applicant_id: int
+    greeting: str
+
+
+class InterviewChatRequest(BaseModel):
+    message: str
+
+
+class InterviewChatResponse(BaseModel):
+    response: str
+    interview_complete: bool
+
+
+class InterviewStatus(BaseModel):
+    id: int
+    name: str
+    program: str
+    is_complete: bool
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class ChatMessageOut(BaseModel):
+    role: str
+    content: str
+    created_at: datetime
+
+    class Config:
+        from_attributes = True

@@ -10,20 +10,50 @@ interface Message {
 export default function ChatModal({
   isOpen,
   onClose,
+  applicantId,
 }: {
   isOpen: boolean;
   onClose: () => void;
+  applicantId: number | null;
 }) {
-  const [messages, setMessages] = useState<Message[]>([
-    {
-      role: "bot",
-      content:
-        "Hello! I'm the Falcon University admission assistant. How can I help you today?",
-    },
-  ]);
+  const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
+  const [isComplete, setIsComplete] = useState(false);
   const bottomRef = useRef<HTMLDivElement | null>(null);
+
+  // Load chat history when modal opens with a valid applicantId
+  useEffect(() => {
+    if (isOpen && applicantId) {
+      setIsComplete(false);
+      fetch(`http://localhost:8000/interview/${applicantId}/messages`)
+        .then((res) => {
+          if (!res.ok) throw new Error("Failed to load messages");
+          return res.json();
+        })
+        .then((data: { role: string; content: string }[]) => {
+          const loaded: Message[] = data.map((m) => ({
+            role: m.role === "user" ? "user" : "bot",
+            content: m.content,
+          }));
+          setMessages(loaded);
+        })
+        .catch(() => {
+          setMessages([
+            {
+              role: "bot",
+              content:
+                "Hello! Welcome to Falcon University Admission Pre-Assessment. Let's get started — what is your full name?",
+            },
+          ]);
+        });
+    } else if (!isOpen) {
+      setMessages([]);
+      setInput("");
+      setLoading(false);
+      setIsComplete(false);
+    }
+  }, [isOpen, applicantId]);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -31,7 +61,7 @@ export default function ChatModal({
 
   const sendMessage = async () => {
     const text = input.trim();
-    if (!text || loading) return;
+    if (!text || loading || !applicantId || isComplete) return;
 
     const userMsg: Message = { role: "user", content: text };
     setMessages((prev) => [...prev, userMsg]);
@@ -39,19 +69,29 @@ export default function ChatModal({
     setLoading(true);
 
     try {
-      const res = await fetch("http://localhost:8000/chat", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message: text }),
-      });
+      const res = await fetch(
+        `http://localhost:8000/interview/${applicantId}/chat`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ message: text }),
+        }
+      );
 
       if (!res.ok) {
         throw new Error(`HTTP ${res.status}`);
       }
 
       const data = await res.json();
-      const botMsg: Message = { role: "bot", content: data.response || "..." };
+      const botMsg: Message = {
+        role: "bot",
+        content: data.response || "...",
+      };
       setMessages((prev) => [...prev, botMsg]);
+
+      if (data.interview_complete) {
+        setIsComplete(true);
+      }
     } catch (err) {
       setMessages((prev) => [
         ...prev,
@@ -72,9 +112,14 @@ export default function ChatModal({
       <div className="flex w-full max-w-xl flex-col rounded-2xl bg-white shadow-2xl max-h-[80vh]">
         {/* Header */}
         <div className="flex items-center justify-between border-b px-6 py-4">
-          <h2 className="text-lg font-semibold text-slate-900">
-            Admission Interview
-          </h2>
+          <div>
+            <h2 className="text-lg font-semibold text-slate-900">
+              Admission Interview
+            </h2>
+            {applicantId && (
+              <p className="text-xs text-slate-500">ID: {applicantId}</p>
+            )}
+          </div>
           <button
             onClick={onClose}
             className="rounded-md p-1 text-slate-500 hover:bg-slate-100 hover:text-slate-700"
@@ -106,7 +151,7 @@ export default function ChatModal({
               }`}
             >
               <div
-                className={`max-w-[75%] rounded-2xl px-4 py-2 text-sm ${
+                className={`max-w-[75%] rounded-2xl px-4 py-2 text-sm whitespace-pre-wrap ${
                   msg.role === "user"
                     ? "bg-blue-600 text-white rounded-br-none"
                     : "bg-slate-100 text-slate-800 rounded-bl-none"
@@ -126,6 +171,15 @@ export default function ChatModal({
           <div ref={bottomRef} />
         </div>
 
+        {/* Completion banner */}
+        {isComplete && (
+          <div className="border-t bg-green-50 px-6 py-3">
+            <p className="text-sm font-medium text-green-800">
+              Interview complete! Your application has been evaluated.
+            </p>
+          </div>
+        )}
+
         {/* Input */}
         <div className="border-t px-6 py-4">
           <div className="flex gap-2">
@@ -134,12 +188,17 @@ export default function ChatModal({
               value={input}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && sendMessage()}
-              placeholder="Type your message..."
-              className="flex-1 rounded-lg border border-slate-300 px-4 py-2 text-sm focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500"
+              placeholder={
+                isComplete
+                  ? "Interview finished"
+                  : "Type your message..."
+              }
+              disabled={isComplete || loading}
+              className="flex-1 rounded-lg border border-slate-300 px-4 py-2 text-sm focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500 disabled:bg-slate-100 disabled:text-slate-500"
             />
             <button
               onClick={sendMessage}
-              disabled={loading || !input.trim()}
+              disabled={loading || !input.trim() || isComplete}
               className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed"
             >
               Send
