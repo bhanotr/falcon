@@ -16,6 +16,7 @@ class UserCreate(BaseModel):
 class UserOut(BaseModel):
     id: int
     username: str
+    is_admin: bool
 
     class Config:
         from_attributes = True
@@ -81,6 +82,64 @@ class ChatMessageOut(BaseModel):
     role: str
     content: str
     created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+# -----------------------
+# Admin schemas
+# -----------------------
+
+class AdminApplicantListItem(BaseModel):
+    id: int
+    name: str
+    program: str
+    is_complete: bool
+    created_at: datetime
+    outcome: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+class AdminAssessmentOut(BaseModel):
+    outcome: str
+    rule_summary: Optional[str] = None
+    transcript: Optional[str] = None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class AdminApplicantDetail(BaseModel):
+    id: int
+    name: str
+    program: str
+    details: Optional[dict] = None
+    is_complete: bool
+    created_at: datetime
+    assessment: Optional[AdminAssessmentOut] = None
+
+    class Config:
+        from_attributes = True
+
+
+class AdminTranscriptMessage(BaseModel):
+    role: str
+    content: str
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class AdminDocumentItem(BaseModel):
+    id: int
+    filename: str
+    uploaded_at: datetime
+    is_active: bool
 
     class Config:
         from_attributes = True

@@ -27,7 +27,7 @@ def get_vectorstore():
     if _vectorstore is None:
         embeddings = OllamaEmbeddings(
             model="embeddinggemma:300m",
-            base_url="http://localhost:11435",
+            base_url=os.getenv("OLLAMA_URL", "http://localhost:11435"),
         )
         _vectorstore = Chroma(
             persist_directory=CHROMA_PERSIST_DIR,
@@ -66,10 +66,24 @@ def delete_document(doc_id: int):
         pass
 
 
-def query_kb(query: str, k: int = 4):
-    """Query the knowledge base and return relevant documents."""
+def query_kb(query: str, k: int = 4, active_doc_ids: set | None = None):
+    """Query the knowledge base and return relevant documents.
+
+    If active_doc_ids is provided, only return chunks belonging to those docs.
+    """
     try:
         vs = get_vectorstore()
-        return vs.similarity_search(query, k=k)
+        # Fetch more results than needed so we can filter and still return k
+        results = vs.similarity_search(query, k=k * 4)
+        if active_doc_ids is None:
+            return results[:k]
+        filtered = []
+        for doc in results:
+            doc_id = doc.metadata.get("doc_id")
+            if doc_id is not None and int(doc_id) in active_doc_ids:
+                filtered.append(doc)
+            if len(filtered) >= k:
+                break
+        return filtered
     except Exception:
         return []

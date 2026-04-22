@@ -7,3 +7,5 @@ __pycache__/
 .pytest_cache/
 .DS_Store
 *.Zone.Identifier
+cdk/cdk.out/
+cdk/cdk.context.json

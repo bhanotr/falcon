@@ -36,11 +36,38 @@ def on_startup():
     # Inline migration: add new columns to existing tables if missing
     inspector = inspect(engine)
     applicant_cols = [c["name"] for c in inspector.get_columns("applicants")]
+    user_cols = [c["name"] for c in inspector.get_columns("users")]
+    document_cols = [c["name"] for c in inspector.get_columns("documents")]
     with engine.begin() as conn:
         if "details" not in applicant_cols:
             conn.execute(text("ALTER TABLE applicants ADD COLUMN details JSONB DEFAULT '{}'"))
         if "is_complete" not in applicant_cols:
             conn.execute(text("ALTER TABLE applicants ADD COLUMN is_complete BOOLEAN DEFAULT FALSE"))
+        if "is_admin" not in user_cols:
+            conn.execute(text("ALTER TABLE users ADD COLUMN is_admin BOOLEAN DEFAULT FALSE"))
+        if "is_active" not in document_cols:
+            conn.execute(text("ALTER TABLE documents ADD COLUMN is_active BOOLEAN DEFAULT TRUE"))
+
+    # Seed admin user if env vars are set
+    admin_username = os.getenv("ADMIN_USERNAME")
+    admin_password = os.getenv("ADMIN_PASSWORD")
+    if admin_username and admin_password:
+        db = next(get_db())
+        try:
+            existing = db.query(models.User).filter(models.User.username == admin_username).first()
+            if not existing:
+                user = models.User(
+                    username=admin_username,
+                    hashed_password=auth.get_password_hash(admin_password),
+                    is_admin=True,
+                )
+                db.add(user)
+                db.commit()
+            elif not existing.is_admin:
+                existing.is_admin = True
+                db.commit()
+        finally:
+            db.close()
 
 
 @app.get("/health", tags=["Health"])
@@ -192,17 +219,22 @@ def get_llm_client():
     if _llm_client is None:
         _llm_client = OpenAI(
             api_key=os.getenv("OPENAI_API_KEY", ""),
-            base_url="http://localhost:11434/v1",
+            base_url=os.getenv("LLM_GATEWAY_URL", "http://localhost:11434/v1"),
         )
     return _llm_client
 
 
+def _get_active_doc_ids(db: Session) -> set:
+    return {d.id for d in db.query(models.Document).filter(models.Document.is_active == True).all()}
+
+
 @app.post("/chat", response_model=schemas.ChatResponse, tags=["Chat"])
-def chat(payload: schemas.ChatRequest):
+def chat(payload: schemas.ChatRequest, db: Session = Depends(get_db)):
     """Handle a student chat message. Queries the knowledge base and returns an LLM response."""
-    # 1. Retrieve relevant context from knowledge base
+    # 1. Retrieve relevant context from knowledge base (active docs only)
     try:
-        docs = knowledge_base.query_kb(payload.message, k=4)
+        active_ids = _get_active_doc_ids(db)
+        docs = knowledge_base.query_kb(payload.message, k=4, active_doc_ids=active_ids)
         context = "\n\n".join([d.page_content for d in docs]) if docs else ""
     except Exception:
         context = ""
@@ -297,16 +329,20 @@ def _evaluate_applicant(applicant_id: int, db: Session) -> dict:
         .all()
     )
 
-    # Build transcripts
-    transcript = "\n".join([f"{m.role}: {m.content}" for m in messages])
-    user_responses = []
+    # Build full transcript (bot + user) for context window
+    transcript_lines = []
     for m in messages:
-        if m.role == "user":
-            user_responses.append(f"- {m.content}")
-    user_transcript = "\n".join(user_responses) if user_responses else "(no responses yet)"
+        transcript_lines.append(f"{m.role}: {m.content}")
+    full_transcript = "\n".join(transcript_lines)
 
-    # Query KB for program requirements
-    docs = knowledge_base.query_kb(f"{applicant.program} admission requirements eligibility", k=6)
+    # Soft cap: keep last ~30 turns to stay within context window (~8k chars).
+    # A guided interview rarely exceeds 30 turns, so this is a safety guard.
+    if len(full_transcript) > 12000:
+        full_transcript = "... [truncated] ...\n" + full_transcript[-12000:]
+
+    # Query KB for program requirements (active docs only)
+    active_ids = _get_active_doc_ids(db)
+    docs = knowledge_base.query_kb(f"{applicant.program} admission requirements eligibility", k=6, active_doc_ids=active_ids)
     context = "\n\n".join([d.page_content for d in docs]) if docs else ""
 
     eval_prompt = (
@@ -315,26 +351,29 @@ def _evaluate_applicant(applicant_id: int, db: Session) -> dict:
         "and return a definitive JSON verdict.\n\n"
         "CRITICAL INSTRUCTIONS:\n"
         "1. The official program requirements ARE provided below under 'Program Requirements'. Use ONLY those requirements.\n"
-        "2. The applicant's stated information is provided under 'Applicant Responses'. Read it carefully.\n"
-        "3. Do NOT say you lack information or cannot confirm. Work with what the applicant provided.\n"
-        "4. Compare each requirement against the applicant's responses and decide definitively.\n"
-        "5. If the applicant meets all stated requirements → status = 'eligible'.\n"
-        "6. If the applicant fails one or more hard requirements → status = 'not_eligible'.\n"
-        "7. If the applicant is missing required documents or information → status = 'needs_more_info'.\n"
-        "8. Your reasoning must be brief (1-2 sentences max).\n"
-        "9. If status is 'needs_more_info', list the exact missing items in 'missing_items' array.\n\n"
+        "2. The FULL interview transcript is provided under 'Interview Transcript' — read it carefully. It contains both the bot's questions AND the applicant's answers.\n"
+        "3. You must ONLY mark an item as 'missing' if the bot EXPLICITLY asked the applicant for it and the applicant failed to provide it.\n"
+        "4. If a requirement was never asked about during the interview, do NOT list it in 'missing_items' and do NOT assume the applicant lacks it.\n"
+        "5. Do NOT hallucinate values for fields that were never discussed. Leave them absent or null in 'details'.\n"
+        "6. Do NOT say you lack information or cannot confirm. Work with what was provided in the transcript.\n"
+        "7. Compare each requirement against the applicant's responses and decide definitively.\n"
+        "8. If the applicant meets all stated requirements → status = 'eligible'.\n"
+        "9. If the applicant fails one or more hard requirements → status = 'not_eligible'.\n"
+        "10. If the applicant is missing required documents or information (that were explicitly asked for) → status = 'needs_more_info'.\n"
+        "11. Your reasoning must be brief (1-2 sentences max).\n"
+        "12. If status is 'needs_more_info', list the exact missing items in 'missing_items' array.\n\n"
         "Respond ONLY with valid JSON in this exact format:\n"
         '{\n'
         '  "name": "...",\n'
         '  "program": "...",\n'
-        '  "details": { "age": null, "gpa": null, "sat_score": null, "act_score": null, "english_test": null, "has_recommendation": null, "has_personal_statement": null, "high_school_completed": null, "math_courses": null },\n'
+        '  "details": { /* ONLY include fields that were actually discussed in the interview */ },\n'
         '  "status": "eligible | not_eligible | needs_more_info",\n'
         '  "reasoning": "1-2 sentence explanation",\n'
         '  "missing_items": ["item 1", "item 2"],\n'
         '  "next_steps": "what the applicant should do next"\n'
         "}\n\n"
         f"Program Requirements:\n{context}\n\n"
-        f"Applicant Responses:\n{user_transcript}"
+        f"Interview Transcript:\n{full_transcript}"
     )
 
     client = get_llm_client()
@@ -391,10 +430,15 @@ def _evaluate_applicant(applicant_id: int, db: Session) -> dict:
     if next_steps:
         user_message += f"\n\nNext steps: {next_steps}"
 
+    # Safe-merge details: update with non-null values from eval, keep existing data
+    existing_details = applicant.details or {}
+    new_details = result.get("details", {})
+    merged_details = {**existing_details, **{k: v for k, v in new_details.items() if v is not None}}
+
     # Update applicant record
     applicant.name = result.get("name", applicant.name)
     applicant.program = result.get("program", applicant.program)
-    applicant.details = result.get("details", {})
+    applicant.details = merged_details
     applicant.is_complete = True
     db.commit()
 
@@ -403,7 +447,7 @@ def _evaluate_applicant(applicant_id: int, db: Session) -> dict:
         applicant_id=applicant.id,
         outcome=status,
         rule_summary=reasoning,
-        transcript=transcript,
+        transcript=full_transcript,
     )
     db.add(assessment)
     db.commit()
@@ -484,11 +528,12 @@ def interview_chat(applicant_id: int, payload: schemas.InterviewChatRequest, db:
     # Build LLM message list
     llm_messages = []
 
-    # Query KB if program is known
+    # Query KB if program is known (active docs only)
     context = ""
     if applicant.program and applicant.program != "Unknown":
         try:
-            docs = knowledge_base.query_kb(f"{applicant.program} admission requirements eligibility", k=4)
+            active_ids = _get_active_doc_ids(db)
+            docs = knowledge_base.query_kb(f"{applicant.program} admission requirements eligibility", k=4, active_doc_ids=active_ids)
             context = "\n\n".join([d.page_content for d in docs]) if docs else ""
         except Exception:
             context = ""
@@ -540,3 +585,94 @@ def interview_chat(applicant_id: int, payload: schemas.InterviewChatRequest, db:
             answer = f"Interview complete, but evaluation failed: {e}"
 
     return {"response": answer, "interview_complete": interview_complete}
+
+
+# -----------------------
+# Admin endpoints
+# -----------------------
+
+@app.get("/admin/applicants", response_model=list[schemas.AdminApplicantListItem], tags=["Admin"])
+def admin_list_applicants(
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_admin_user),
+):
+    """List all applicants with their latest assessment outcome."""
+    applicants = db.query(models.Applicant).order_by(models.Applicant.created_at.desc()).all()
+    results = []
+    for a in applicants:
+        latest = db.query(models.Assessment).filter(models.Assessment.applicant_id == a.id).order_by(models.Assessment.created_at.desc()).first()
+        results.append({
+            "id": a.id,
+            "name": a.name,
+            "program": a.program,
+            "is_complete": a.is_complete,
+            "created_at": a.created_at,
+            "outcome": latest.outcome if latest else None,
+        })
+    return results
+
+
+@app.get("/admin/applicants/{applicant_id}", response_model=schemas.AdminApplicantDetail, tags=["Admin"])
+def admin_get_applicant(
+    applicant_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_admin_user),
+):
+    """Get full applicant details including assessment."""
+    applicant = db.query(models.Applicant).filter(models.Applicant.id == applicant_id).first()
+    if not applicant:
+        raise HTTPException(status_code=404, detail="Applicant not found")
+    latest = db.query(models.Assessment).filter(models.Assessment.applicant_id == applicant.id).order_by(models.Assessment.created_at.desc()).first()
+    return {
+        "id": applicant.id,
+        "name": applicant.name,
+        "program": applicant.program,
+        "details": applicant.details,
+        "is_complete": applicant.is_complete,
+        "created_at": applicant.created_at,
+        "assessment": latest,
+    }
+
+
+@app.get("/admin/applicants/{applicant_id}/transcript", response_model=list[schemas.AdminTranscriptMessage], tags=["Admin"])
+def admin_get_transcript(
+    applicant_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_admin_user),
+):
+    """Get full chat transcript for an applicant."""
+    applicant = db.query(models.Applicant).filter(models.Applicant.id == applicant_id).first()
+    if not applicant:
+        raise HTTPException(status_code=404, detail="Applicant not found")
+    messages = (
+        db.query(models.ChatMessage)
+        .filter(models.ChatMessage.applicant_id == applicant_id)
+        .order_by(models.ChatMessage.created_at)
+        .all()
+    )
+    return messages
+
+
+@app.get("/admin/documents", response_model=list[schemas.AdminDocumentItem], tags=["Admin"])
+def admin_list_documents(
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_admin_user),
+):
+    """List all knowledge base documents with active status."""
+    return db.query(models.Document).order_by(models.Document.uploaded_at.desc()).all()
+
+
+@app.patch("/admin/documents/{doc_id}/toggle", response_model=schemas.AdminDocumentItem, tags=["Admin"])
+def admin_toggle_document(
+    doc_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_admin_user),
+):
+    """Toggle a document's active status."""
+    doc = db.query(models.Document).filter(models.Document.id == doc_id).first()
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+    doc.is_active = not doc.is_active
+    db.commit()
+    db.refresh(doc)
+    return doc
