@@ -77,24 +77,26 @@ class FalconStack(Stack):
 
         user_data = ec2.UserData.for_linux()
         user_data.add_commands(
+            "set -euxo pipefail",
+            "exec > >(tee /var/log/user-data.log) 2>&1",
             # Update and install Docker, Git
             "dnf update -y",
             "dnf install -y docker git",
             "systemctl enable docker",
             "systemctl start docker",
             "usermod -aG docker ec2-user",
-            # Docker Compose plugin
+            # Docker Compose plugin (pinned to v2.24.5 for Docker 25.x compatibility)
             'DOCKER_CONFIG=${DOCKER_CONFIG:-/usr/local/lib/docker}',
             'mkdir -p $DOCKER_CONFIG/cli-plugins',
-            'curl -SL https://github.com/docker/compose/releases/latest/download/docker-compose-linux-x86_64 -o $DOCKER_CONFIG/cli-plugins/docker-compose',
+            'curl -SL https://github.com/docker/compose/releases/download/v2.24.5/docker-compose-linux-x86_64 -o $DOCKER_CONFIG/cli-plugins/docker-compose',
             'chmod +x $DOCKER_CONFIG/cli-plugins/docker-compose',
-            'ln -s $DOCKER_CONFIG/cli-plugins/docker-compose /usr/local/bin/docker-compose',
+            'ln -sf $DOCKER_CONFIG/cli-plugins/docker-compose /usr/local/bin/docker-compose',
             # Swap
-            "fallocate -l 4G /swapfile",
+            "fallocate -l 4G /swapfile || true",
             "chmod 600 /swapfile",
-            "mkswap /swapfile",
-            "swapon /swapfile",
-            "echo '/swapfile none swap sw 0 0' >> /etc/fstab",
+            "mkswap /swapfile || true",
+            "swapon /swapfile || true",
+            "grep -q swapfile /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab",
             # Clone repo
             "mkdir -p /opt/falcon",
             "git clone https://github.com/bhanotr/falcon.git /opt/falcon || true",
@@ -102,6 +104,7 @@ class FalconStack(Stack):
             f"cat > /opt/falcon/.env << 'EOF'\nOPENAI_API_KEY={openai_key}\nSECRET_KEY=supersecretkey-{openai_key[:8]}\nEOF",
             # Start containers
             "cd /opt/falcon && docker compose up -d --build",
+            "echo '=== Bootstrap complete ==='",
         )
 
         instance = ec2.Instance(
