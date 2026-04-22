@@ -43,25 +43,22 @@ services:
       retries: 5
       start_period: 30s
 
-  ollama-llm:
+  llm-gateway:
     build:
-      context: ./ollama
+      context: ./llm-gateway
       dockerfile: Dockerfile
-    image: localhost/falcon-ollama:latest
-    container_name: falcon_ollama_llm
+    image: localhost/falcon-llm-gateway:latest
+    container_name: falcon_llm_gateway
     restart: unless-stopped
     network_mode: host
     environment:
-      OLLAMA_HOST: 0.0.0.0:11434
-      MODEL_NAME: qwen3.5:0.8b
-    volumes:
-      - falcon_ollama_llm:/root/.ollama
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
     healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:11434/api/tags || exit 1"]
-      interval: 30s
+      test: ["CMD-SHELL", "curl -f http://localhost:11434/v1/models || exit 1"]
+      interval: 15s
       timeout: 10s
-      retries: 10
-      start_period: 60s
+      retries: 5
+      start_period: 30s
 
   ollama-embedding:
     build:
@@ -87,5 +84,4 @@ volumes:
   falcon_postgres_data:
   falcon_uploads:
   falcon_chroma_data:
-  falcon_ollama_llm:
   falcon_ollama_embedding:
