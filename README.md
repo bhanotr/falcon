@@ -178,6 +178,45 @@ This terminates the EC2 instance, security group, IAM role, and all associated r
 
 ---
 
+## Product Thinking Assessment
+
+### 1. Stakeholder Alignment
+
+**Key stakeholders** for the admission pre-assessment tool include:
+
+- **Prospective Students** — Need a low-friction, intuitive way to demonstrate eligibility without bureaucratic hurdles.
+- **Admissions Office / Admin Staff** — Need accurate, reviewable data to make informed decisions efficiently.
+- **University Leadership / Compliance** — Need fairness, transparency, and adherence to institutional policies and legal standards.
+- **IT / DevOps** — Need a maintainable, secure, and cost-effective deployment model.
+
+To ensure their needs are reflected in the product roadmap, I would:
+- Run **monthly stakeholder syncs** with admissions staff to identify workflow pain points (e.g., bulk review, transcript search).
+- Conduct **usability testing** with a small cohort of prospective students before each major release.
+- Maintain a **public changelog** and internal RFC process so IT can review security and infrastructure implications early.
+- Prioritize the backlog using a **RICE score** (Reach, Impact, Confidence, Effort) weighted toward student accessibility and admin efficiency.
+
+### 2. Success Metrics
+
+| Metric | Why It Matters | Target |
+|--------|----------------|--------|
+| **Interview Completion Rate** | Measures whether the chat interface is intuitive enough for students to finish. A low rate signals UX friction. | > 85% |
+| **Admin Review Time per Applicant** | Measures operational efficiency. If the AI successfully surfaces key insights, reviewers spend less time reading raw transcripts. | < 3 minutes |
+| **Qualitative Feedback Score** | Post-interview NPS or CSAT from students and a weekly Likert-scale survey from admins captures sentiment that raw data misses. | > 4.0 / 5 |
+
+### 3. Risk Awareness
+
+**Major Risk: Algorithmic Bias in Eligibility Screening**
+
+AI models can inadvertently favor or disfavor candidates based on linguistic style, cultural references, or socioeconomic cues embedded in their responses. In an admissions context, this is not just a product risk — it is a legal and reputational liability.
+
+**Mitigation strategies:**
+- **Human-in-the-loop review:** The AI acts as a *pre-assessment assistant* that structures and summarizes data; final eligibility decisions are always made by human reviewers.
+- **Bias auditing:** Periodically run synthetic applicant profiles through the system to detect disparate outcomes across demographics.
+- **Transparency & consent:** Clearly disclose to applicants that an AI is assisting the process, and provide an alternative pathway (e.g., traditional written application) upon request.
+- **Grounded outputs:** Use retrieval-augmented generation (RAG) with a controlled knowledge base so the bot does not hallucinate eligibility criteria.
+
+---
+
 ## License
 
 MIT
