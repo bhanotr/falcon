@@ -6,7 +6,8 @@ app = cdk.App()
 
 openai_key = app.node.try_get_context("openai_key")
 if not openai_key:
-    raise ValueError("Missing CDK context 'openai_key'. Pass it with: cdk deploy -c openai_key=sk-...")
+    # Allow synth/bootstrap to proceed with a dummy key
+    openai_key = "dummy-key"
 
 FalconStack(
     app,
